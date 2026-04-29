@@ -1,10 +1,13 @@
 import codecs
+import contextvars
 import dataclasses
+import functools
 import linecache
 import os
 import tempfile
+import threading
 from ast import literal_eval
-from collections import ChainMap
+from collections import ChainMap, OrderedDict
 from contextlib import contextmanager
 from itertools import chain, islice
 from types import CodeType
@@ -18,6 +21,7 @@ from typing import (
     Optional,
     Union,
     Set,
+    Tuple,
     Type,
     NoReturn,
 )
@@ -501,46 +505,74 @@ def _is_dunder_name(name: str) -> bool:
     return name.startswith("__") and name.endswith("__")
 
 
+# Per-render node, set by render_template via undefined_node_context. The old
+# create_undefined(node) baked node into a freshly-defined class on every
+# get_environment call, which made the resulting Environment per-node and
+# uncacheable. The cached environment now uses _DbtUndefined unconditionally,
+# and the node attributed in errors is read from this contextvar at instance
+# creation time.
+_undefined_node: contextvars.ContextVar[Optional[_NodeProtocol]] = contextvars.ContextVar(
+    "_dbt_undefined_node", default=None
+)
+
+
+@contextmanager
+def undefined_node_context(node: Optional[_NodeProtocol]) -> Iterator[None]:
+    token = _undefined_node.set(node)
+    try:
+        yield
+    finally:
+        _undefined_node.reset(token)
+
+
+class _DbtUndefined(jinja2.Undefined):
+    def __init__(
+        self,
+        hint: Optional[str] = None,
+        obj: Any = None,
+        name: Optional[str] = None,
+        exc: Any = None,
+    ) -> None:
+        super().__init__(hint=hint, name=name)
+        self.node = _undefined_node.get()
+        self.name = name
+        self.hint = hint
+        # jinja uses these for safety, so we have to override them.
+        # see https://github.com/pallets/jinja/blob/master/jinja2/sandbox.py#L332-L339 # noqa
+        self.unsafe_callable = False
+        self.alters_data = False
+
+    def __getitem__(self, name: Any) -> "_DbtUndefined":
+        # Propagate the undefined value if a caller accesses this as if it
+        # were a dictionary
+        return self
+
+    def __getattr__(self, name: str) -> "_DbtUndefined":
+        if name == "name" or _is_dunder_name(name):
+            raise AttributeError(
+                "'{}' object has no attribute '{}'".format(type(self).__name__, name)
+            )
+
+        self.name = name
+
+        return self.__class__(hint=self.hint, name=self.name)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> "_DbtUndefined":
+        return self
+
+    def __reduce__(self) -> NoReturn:
+        # Use self.node (captured at __init__ from the render-time contextvar)
+        # rather than reading the contextvar again here. Pickling can happen
+        # outside a render context (e.g. during manifest serialization), where
+        # _undefined_node would resolve to None and lose the original attribution.
+        raise UndefinedCompilationError(name=self.name or "unknown", node=self.node)
+
+
 def create_undefined(node: Optional[_NodeProtocol] = None) -> Type[jinja2.Undefined]:
-    class Undefined(jinja2.Undefined):
-        def __init__(
-            self,
-            hint: Optional[str] = None,
-            obj: Any = None,
-            name: Optional[str] = None,
-            exc: Any = None,
-        ) -> None:
-            super().__init__(hint=hint, name=name)
-            self.node = node
-            self.name = name
-            self.hint = hint
-            # jinja uses these for safety, so we have to override them.
-            # see https://github.com/pallets/jinja/blob/master/jinja2/sandbox.py#L332-L339 # noqa
-            self.unsafe_callable = False
-            self.alters_data = False
-
-        def __getitem__(self, name: Any) -> "Undefined":
-            # Propagate the undefined value if a caller accesses this as if it
-            # were a dictionary
-            return self
-
-        def __getattr__(self, name: str) -> "Undefined":
-            if name == "name" or _is_dunder_name(name):
-                raise AttributeError(
-                    "'{}' object has no attribute '{}'".format(type(self).__name__, name)
-                )
-
-            self.name = name
-
-            return self.__class__(hint=self.hint, name=self.name)
-
-        def __call__(self, *args: Any, **kwargs: Any) -> "Undefined":
-            return self
-
-        def __reduce__(self) -> NoReturn:
-            raise UndefinedCompilationError(name=self.name or "unknown", node=node)
-
-    return Undefined
+    # Backwards-compat shim. Node is now resolved at use time via contextvar,
+    # so the same class is returned regardless of node. Kept callable for any
+    # external consumer that imports this name.
+    return _DbtUndefined
 
 
 def is_list(value):
@@ -565,17 +597,18 @@ TEXT_FILTERS: Dict[str, Callable[[Any], Any]] = {
 }
 
 
-def get_environment(
-    node: Optional[_NodeProtocol] = None,
-    capture_macros: bool = False,
-    native: bool = False,
-) -> jinja2.Environment:
+@functools.lru_cache(maxsize=8)
+def _build_environment(capture_macros: bool, native: bool) -> jinja2.Environment:
+    # The (capture_macros, native) tuple is the only state that distinguishes
+    # one Environment configuration from another for our use. Node was the
+    # third axis before, but it is now resolved per-render via _undefined_node,
+    # so the same Environment + Template can serve every node.
     args: Dict[str, List[Union[str, Type[jinja2.ext.Extension]]]] = {
         "extensions": ["jinja2.ext.do", "jinja2.ext.loopcontrols"]
     }
 
     if capture_macros:
-        args["undefined"] = create_undefined(node)  # type: ignore
+        args["undefined"] = _DbtUndefined  # type: ignore
 
     args["extensions"].append(MaterializationExtension)
     args["extensions"].append(DocumentationExtension)
@@ -593,6 +626,17 @@ def get_environment(
     env.filters.update(filters)
 
     return env
+
+
+def get_environment(
+    node: Optional[_NodeProtocol] = None,
+    capture_macros: bool = False,
+    native: bool = False,
+) -> jinja2.Environment:
+    # ``node`` is preserved in the signature for backwards compatibility with
+    # external callers (e.g. dbt-core/clients/jinja_static.py). It is no longer
+    # part of the cache key -- see ``_build_environment``.
+    return _build_environment(capture_macros, native)
 
 
 @contextmanager
@@ -630,6 +674,39 @@ def parse(string: Any) -> jinja2.nodes.Template:
         return parsed
 
 
+# Compiled-template cache. Same source compiled into the same kind of
+# environment (capture_macros, native) yields the same Template, so we share
+# it across nodes. The eviction bound exists only to cap memory in pathological
+# cases; under normal parses we expect the working set to fit easily.
+_TEMPLATE_CACHE_MAX = 50_000
+_template_cache: "OrderedDict[Tuple[str, bool, bool], jinja2.Template]" = OrderedDict()
+_template_cache_lock = threading.Lock()
+
+
+def _get_cached_template(
+    source: str,
+    capture_macros: bool,
+    native: bool,
+    node: Optional[_NodeProtocol],
+) -> jinja2.Template:
+    key = (source, capture_macros, native)
+    with _template_cache_lock:
+        cached = _template_cache.get(key)
+        if cached is not None:
+            _template_cache.move_to_end(key)
+            return cached
+    # Compile outside the lock so distinct templates can compile concurrently.
+    with catch_jinja(node):
+        env = get_environment(node, capture_macros, native=native)
+        template = env.from_string(source)
+    with _template_cache_lock:
+        _template_cache[key] = template
+        _template_cache.move_to_end(key)
+        while len(_template_cache) > _TEMPLATE_CACHE_MAX:
+            _template_cache.popitem(last=False)
+    return template
+
+
 def get_template(
     string: str,
     ctx: Dict[str, Any],
@@ -637,18 +714,33 @@ def get_template(
     capture_macros: bool = False,
     native: bool = False,
 ) -> jinja2.Template:
-    with catch_jinja(node):
-        env = get_environment(node, capture_macros, native=native)
-
-        template_source = str(string)
-        return env.from_string(template_source, globals=ctx)
+    # ``ctx`` is no longer baked into ``template.globals`` -- render_template
+    # passes it as ``vars`` and MacroFuzzTemplate.new_context falls back to
+    # using vars directly when globals is empty. The original code set
+    # globals=ctx and then render passed ctx again, producing
+    # ChainMap(ctx, ctx); removing the globals path is observably equivalent.
+    return _get_cached_template(str(string), capture_macros, native, node)
 
 
 def render_template(
     template: jinja2.Template, ctx: Dict[str, Any], node: Optional[_NodeProtocol] = None
 ) -> str:
-    with catch_jinja(node):
+    # ``undefined_node_context`` makes the per-render node available to
+    # ``_DbtUndefined`` instances created during this render, so that
+    # UndefinedCompilationError still attributes the failure to the right
+    # node even though the Undefined class itself is shared across nodes.
+    with catch_jinja(node), undefined_node_context(node):
         return template.render(ctx)
+
+
+def clear_template_cache() -> None:
+    with _template_cache_lock:
+        _template_cache.clear()
+
+
+def template_cache_stats() -> Dict[str, int]:
+    with _template_cache_lock:
+        return {"size": len(_template_cache), "max": _TEMPLATE_CACHE_MAX}
 
 
 _TESTING_BLOCKS_CACHE: Dict[int, List[Union[BlockData, BlockTag]]] = {}
