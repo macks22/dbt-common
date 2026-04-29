@@ -71,17 +71,18 @@ _NUMERIC_FORMAT_NOOPS: Dict[str, Callable[[Any], bool]] = {
     fmt: (lambda _: True) for fmt in ("int32", "int64", "uint64", "float", "double")
 }
 
-# Cache of compiled fastjsonschema validators keyed by id(json_schema). The
-# json_schema dict for each dbtClassMixin subclass is memoized on the class via
-# functools.lru_cache, so id() is stable for the process lifetime. A value of
-# None marks a schema fastjsonschema could not compile (slow path always).
-_FAST_VALIDATOR_CACHE: Dict[int, Optional[Callable[[Any], Any]]] = {}
+# Cache of compiled fastjsonschema validators keyed by the dbtClassMixin
+# subclass. Keying by the class (rather than id(schema)) is correct even if the
+# bounded json_schema lru_cache evicts and the schema dict gets GC'd: classes
+# are stable for the process lifetime, so we never collide a stale entry with
+# an unrelated schema. A value of None marks a class whose schema fastjsonschema
+# could not compile (slow path always).
+_FAST_VALIDATOR_CACHE: Dict[type, Optional[Callable[[Any], Any]]] = {}
 
 
-def _get_fast_validator(schema: Dict[str, Any]) -> Optional[Callable[[Any], Any]]:
-    key = id(schema)
-    if key in _FAST_VALIDATOR_CACHE:
-        return _FAST_VALIDATOR_CACHE[key]
+def _get_fast_validator(cls: type, schema: Dict[str, Any]) -> Optional[Callable[[Any], Any]]:
+    if cls in _FAST_VALIDATOR_CACHE:
+        return _FAST_VALIDATOR_CACHE[cls]
     try:
         # use_default=False avoids fastjsonschema mutating the input dict by
         # injecting schema `default` values (it defaults to True). dbt schemas
@@ -93,9 +94,9 @@ def _get_fast_validator(schema: Dict[str, Any]) -> Optional[Callable[[Any], Any]
             use_default=False,
         )
     except Exception:
-        _FAST_VALIDATOR_CACHE[key] = None
+        _FAST_VALIDATOR_CACHE[cls] = None
         return None
-    _FAST_VALIDATOR_CACHE[key] = compiled
+    _FAST_VALIDATOR_CACHE[cls] = compiled
     return compiled
 
 
@@ -146,7 +147,7 @@ class dbtClassMixin(DataClassMessagePackMixin):
         # On invalid data it raises immediately; we then fall through to the slow
         # path, which is the only one that can produce a properly-typed
         # jsonschema.ValidationError for `ValidationError.create_from(...)`.
-        fast = _get_fast_validator(json_schema)
+        fast = _get_fast_validator(cls, json_schema)
         if fast is not None:
             try:
                 fast(data)
