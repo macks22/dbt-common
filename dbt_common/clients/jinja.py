@@ -561,7 +561,11 @@ class _DbtUndefined(jinja2.Undefined):
         return self
 
     def __reduce__(self) -> NoReturn:
-        raise UndefinedCompilationError(name=self.name or "unknown", node=_undefined_node.get())
+        # Use self.node (captured at __init__ from the render-time contextvar)
+        # rather than reading the contextvar again here. Pickling can happen
+        # outside a render context (e.g. during manifest serialization), where
+        # _undefined_node would resolve to None and lose the original attribution.
+        raise UndefinedCompilationError(name=self.name or "unknown", node=self.node)
 
 
 def create_undefined(node: Optional[_NodeProtocol] = None) -> Type[jinja2.Undefined]:
